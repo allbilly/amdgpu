@@ -8,12 +8,88 @@
 
 | Item | State |
 |------|--------|
+| **✅ SOLVED** | **ATOM `asic_init` now completes — VRAM trains** (`MEMSIZE=4096`, `MISC0=0x50609190`, `trained=True`) |
+| **Root cause** | Two `atom_replay.py` interpreter bugs (not hardware): see 2026-07-08 PM below |
+| **New blocker** | **VRAM data path still dead after training** — BAR0 + MM_INDEX read/write return `0xffffffff`; LoadUcodes still times out (SMC can't DMA TOC/fw) |
+| **Danger** | GTT-sysmem LoadUcodes attempt **crashed USB4** (replug needed) — do NOT retry GTT load without a working VRAM/DMA path |
+| **Next** | Path C: make SMC read fw from GART-mapped **sysmem** safely, or find why trained VRAM has no CPU-visible aperture on USB4 |
+| **Safe to run** | `--probe`, `--selftest`, `--boot-stage=atom`, `--boot-stage=pre-fw` |
+
+---
+
+## 🟢 2026-07-08 PM — ATOM VRAM TRAINING FIXED (interpreter bugs)
+
+**Breakthrough:** the stuck backward-JMP loops were **never hardware memory-training polls.** They were **pure-compute infinite loops caused by two bugs in the `atom_replay.py` bytecode VM.** After fixing both, `ATOM_CMD_INIT` runs to completion in ~0.4 s with **1008 MMIO writes** and leaves:
+
+```
+MEMSIZE = 4096 (0x1000)   MISC0 = 0x50609190 (bit 0x80 set)   trained = True
+```
+
+Confirmed via `add.py --boot-stage=atom` and `--boot-stage=pre-fw` (`trained=True load_ok=True`).
+
+### Bug 1 — `ATOM_ARG_ID` did not dereference the ROM
+
+`atom.c` `ATOM_ARG_ID`: `val = U32(idx + gctx->data_block)` — it **reads the dword at ROM offset** `idx + data_block`. Our code used `val = idx + g.data_block` (the *address*, not the *contents*). This fed garbage into data-table-driven loops. A `data_block += ID[...]` loop counter never converged (`data_block` marched `0xa894 → … → 0xfffe` doubling each step instead of indexing a table), so the `CMP data_block == remainder` exit at `0xd2e8` never hit → infinite loop mislabeled "memory-training JMP poll".
+
+Fix (`_get_src_int`, `ATOM_ARG_ID`):
+```python
+off = (idx + g.data_block) & 0xffff
+val = _u32(bios, off) if off + 4 <= len(bios) else 0
+```
+
+### Bug 2 — missing WS special registers `ATOM_WS_OR_MASK` / `ATOM_WS_AND_MASK`
+
+`atom.h`: `ATOM_WS_SHIFT=0x43, ATOM_WS_OR_MASK=0x44, ATOM_WS_AND_MASK=0x45, ATOM_WS_FB_WINDOW=0x46, ATOM_WS_ATTRIBUTES=0x47`. Our map had `FB_WINDOW=0x46` but **omitted `0x44`/`0x45`** and let `ws[]` array shadow the special regs. Per `atom.c` the `0x40–0x48` switch **takes priority** over `ws[idx]`; `OR_MASK = 1<<shift`, `AND_MASK = ~(1<<shift)` are **read-only** derived values. Mask-building loops (bit set/clear on MC regs) produced wrong masks. Fixed read + write paths so specials win and OR/AND masks compute from `shift`.
+
+### New blocker — trained VRAM has no CPU data path on this eGPU
+
+Even with `trained=True`, all VRAM data access fails:
+
+| Path | Result |
+|------|--------|
+| BAR0 aperture (`dev.vram[off]`) | writes read back `0xffffffff` at every offset |
+| MM_INDEX 0-based (`pos\|0x80000000`) | `0xffffffff` / stale `0xdbaeea31` |
+| MM_INDEX at true MC base (`FB_LOC 0xf4fff400` → `0xf400000000 + off`) | `0xffffffff` |
+| Reprogram FB to 0-based + SYS aperture | still `0xffffffff` |
+| Two-value persistence (A@x, B@y) | not persistent |
+
+`FB_LOCATION` after training = `0xf4fff400` (base `0xf400<<24`, top `0xf4ff`). So VBIOS placed FB at a **40-bit MC base `0xf400_0000_0000`**, not 0. But neither that base nor a 0-based reprogram yields readable VRAM through BAR0 or MM_INDEX over USB4.
+
+`LoadUcodes` (`0x254`) still times out (`RESP=0`) because SMC DMA-reads the TOC/fw from VRAM MC addresses it can't reach.
+
+**Crash post-mortem:** an attempt to route all firmware through **GART-mapped host sysmem** (`AMD_BOOT_FW_LAYOUT=gtt`, RLC-only) **dropped the USB4 link** mid-LoadUcodes and required a physical replug. Treat GTT LoadUcodes as unsafe until the DMA path is proven with a small probe first.
+
+### Aperture diagnosis (2026-07-08 late) — transport-level dead BAR0
+
+`diag_bar0` + `probe_mm` after training confirm the aperture is **dead at the TinyGPU/USB4 transport**, not a base/offset mistake:
+
+- **BAR0 reads a single fixed constant** at *every* offset (`0`, `0x1000`, `0x40000`, `0x1000000`) both **before and after** ATOM training — e.g. `0x36e94e32` this session, `0xdbaeea31` last session (value differs per boot, constant within a session). Writes never change the readback.
+- **MM_INDEX** (`pos | 0x80000000`, `MM_INDEX_HI = pos>>31`) returns the same constant for all offsets; a 5× stability read with no write returns the identical value → it is **not** VRAM, it's a floating/aliased BAR.
+- MC routing regs look sane post-train: `FB_LOCATION=0xf4fff400`, `FB_OFFSET=0`, `BIF_FB_EN=0x3`, `MC_ARB_RAMCFG=0x692`, `HDP_NONSURFACE_BASE=0xf4000000`. Reprogramming FB to a 0-based layout did **not** revive reads.
+
+**Conclusion:** TinyGPU's BAR0 mapping does not reach trained VRAM on this USB4 path. This is the same class of issue as the original "BAR0 dead" note, but now proven to persist *after* successful training — so it is a transport/aperture limitation, not a training gap. Fixing it likely requires TinyGPU-side (closed app) BAR handling or a resizable-BAR/aperture-window register we haven't found.
+
+### add.py current behavior (safe, no crash)
+
+`python3 add.py` now: trains VRAM via ATOM → boots SMC (`resp=0x1`) → reads soft_regs → **cleanly skips LoadUcodes** (prereq gate: no CPU-visible VRAM path) → attempts compute dispatch → exits with an assertion (result is garbage because MEC firmware never loaded). **No more 30–120 s LoadUcodes hang, no USB4 drop.** The `AssertionError` at the end is expected until firmware loads.
+
+### Next debug steps (ordered)
+
+1. **GART-sysmem DMA path (the only remaining route to firmware).** BAR0/MM_INDEX are dead, so the SMC and compute engine must read from **GART-mapped host RAM**. Before any `PPSMC_MSG_LoadUcodes`, prove the path with a **non-destructive probe**: map one `alloc_sysmem` page into GART, have the GPU read it via a *single* engine op or SDMA copy, PCI-health-check, and abort on the first `0xffff`. The earlier crash came from a full LoadUcodes on an unproven DMA path — do the tiny probe first.
+2. **Direct-MMIO firmware load (bypass SMC LoadUcodes).** TrustOS loads SDMA/RLC/MEC via direct MC_SEQ-style register uploads with no `PPSMC_MSG_LoadUcodes`. Since our SMC can't DMA firmware from dead VRAM, this side-steps the whole TOC/header DMA. Port `polaris_sdma_full_init`-style direct upload for RLC+MEC once GART DMA (step 1) is proven.
+3. Only after (1)/(2): retry compute with firmware actually resident.
+
+### Original blocker (now resolved — kept for context)
+
+| Item | Old state |
+|------|-----------|
 | **Blocker** | Layer 1 ATOM `asic_init` incomplete → VRAM not trained |
 | **Proof** | `CONFIG_MEMSIZE=0`, `MISC0&0x80` clear, BAR0 dead |
 | **Next** | Path A: Linux golden trace on same RX570, or Path B: fix `atom_replay.py` JMP polls |
-| **Safe to run** | `--probe`, `--selftest` only |
 | **Code this week** | `atom_replay.py` VBIOS parsers (NootedRed `ATOMBIOS.hpp`) |
 | **Refs reviewed** | 31 AGENTS.md repos — tier-1: `linux` / `ROCm amdgpu` only |
+
+**The old "Path A / Path B" framing was wrong:** no Linux golden trace was needed. The training bytecode was fine; our interpreter mis-decoded `ATOM_ARG_ID` and WS masks.
 
 ---
 

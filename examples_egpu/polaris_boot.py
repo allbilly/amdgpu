@@ -1201,16 +1201,21 @@ class PolarisBoot:
       print("polaris: sysmem_dma_flush fw_buf", flush=True)
 
   def load_ip_firmware_prereqs(self) -> tuple[bool, str, bool, bool]:
-    """Whether LoadUcodes is safe: Linux needs VRAM (BAR0 or MM_INDEX) for TOC/scratch."""
+    """Whether LoadUcodes is safe: Linux needs a CPU-writable VRAM path (BAR0 or
+    MM_INDEX) for the SMC TOC/header/scratch. On this TinyGPU/USB4 eGPU the VRAM
+    aperture is dead even after ATOM training completes, so trained registers
+    alone are NOT sufficient — SMC DMA of the TOC would hang and drop USB4.
+    Require an actually-verified write path, or a GART-sysmem DMA layout."""
     bar0_ok = self.probe_bar0_writes()
     mm_ok = self.probe_vram_mm_writes() if not bar0_ok else False
-    if self.vram_trained():
-      return True, "vram_trained", bar0_ok, mm_ok
+    trained = self.vram_trained()
     if bar0_ok or mm_ok:
-      return True, f"bar0={bar0_ok} mm_index={mm_ok}", bar0_ok, mm_ok
+      return True, f"trained={trained} bar0={bar0_ok} mm_index={mm_ok}", bar0_ok, mm_ok
     return False, (
-      "VRAM not trained (need MEMSIZE>=128 and MISC0|0x80) and BAR0/MM_INDEX dead — "
-      "Linux puts header_buffer/smu_buffer in VRAM; GTT-only LoadUcodes will hang"
+      f"VRAM trained={trained} but no CPU-visible VRAM data path (BAR0+MM_INDEX both "
+      f"dead on this TinyGPU/USB4 transport) — SMC cannot DMA the firmware TOC/header; "
+      f"LoadUcodes will hang and drop the USB4 link. Need a working BAR0 aperture or a "
+      f"proven GART-sysmem DMA path (set AMD_BOOT_LOADUCODES_UNTRAINED=1 to force — unsafe)."
     ), bar0_ok, mm_ok
 
   def load_ip_firmware(self):

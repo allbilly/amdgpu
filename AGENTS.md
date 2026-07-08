@@ -1,4 +1,17 @@
 ask deepwiki on github repo
+- kc9zda/atombios-inspect
+- Zile995/PinnacleRidge-Polaris-GPU-Passthrough
+- Aitbytes/proxmox-amd-gpu-passthrough
+- ChefKissInc/NootedRed
+- ChefKissInc/NootRX
+- coreboot/coreboot
+- acidanthera/Whatevergreen
+- heavyarms2112/atitool
+- Andybf/AtomBiosEditor
+- ROCm/amdgpu
+- xCuri0/ReBarUEFI
+- komen205/polaris30-smu-bist
+- nathan237/TrustOS
 - allbilly/amdgpu
 - allbilly/applegpu
 - VerticalResearchGroup/miaow

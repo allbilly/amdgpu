@@ -74,8 +74,11 @@ ATOM_WS_SHIFT, ATOM_WS_OR_MASK, ATOM_WS_AND_MASK = 0x43, 0x44, 0x45
 ATOM_WS_FB_WINDOW, ATOM_WS_ATTRIBUTES = 0x46, 0x47
 ATOM_WS_REGPTR = 0x48
 ATOM_EXECUTE_MAX_DEPTH = 32
-ATOM_CMD_TIMEOUT_SEC = float(os.environ.get("AMD_ATOM_JUMP_TIMEOUT_SEC", "120"))
-ATOM_JUMP_MAX_ITERS = int(os.environ.get("AMD_ATOM_JUMP_MAX", "512"))
+ATOM_CMD_TIMEOUT_SEC = float(os.environ.get("AMD_ATOM_JUMP_TIMEOUT_SEC", "30"))
+# Real asic_init timed poll loops (e.g. DELAY_MS settle at 0xd03f) legitimately
+# iterate a few thousand times; 512 falsely aborted them. Wall-clock timeout is
+# the true stuck-loop guard.
+ATOM_JUMP_MAX_ITERS = int(os.environ.get("AMD_ATOM_JUMP_MAX", "50000"))
 # MC / idle registers polled during asic_init memory training
 ATOM_MC_POLL_REGS = frozenset({0xa80, 0x150a, 0xa29, 0xa2a, 0xe50, 0x2004, 0x1})
 ATOM_MAX_WRITES = int(os.environ.get("AMD_ATOM_MAX_WRITES", "65536"))

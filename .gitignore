@@ -23,6 +23,5 @@ triangle.ppm
 
 # Large local checkouts (clone separately or use submodules)
 /ref/
-/mgpusim/
 /navisim/
 **/.DS_Store

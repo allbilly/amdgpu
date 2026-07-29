@@ -147,7 +147,7 @@ func TestVaddCoU32VOP3b(t *testing.T) {
 ## File Locations
 
 ```
-mgpusim/
+~/mgpusim/
 └── amd/
     ├── insts/           # Instruction decoding
     │   ├── decodetable.go    # Add to decode table

@@ -7,13 +7,13 @@ This document summarizes our investigation into MGPUSim's support for V5 HSA cod
 ## Key Findings
 
 ### 1. MGPUSim V5 Code Object Parsing
-- **Location**: `mgpusim/amd/insts/hsaco.go`
+- **Location**: `~/mgpusim/amd/insts/hsaco.go`
 - **Support Status**: ✅ Parser exists and parses V5 kernel descriptors
 - **CodeObjectV5** type is defined
 - `parseV5KernelDescriptor()` function handles V5 format
 
 ### 2. MGPUSim Emulator Limitations
-- **Location**: `mgpusim/amd/emu/`
+- **Location**: `~/mgpusim/amd/emu/`
 - **Issue**: GCN3 emulator doesn't support all GFX900 (Vega) instructions
 - **Affected Instructions**:
   - `v_add_co_u32_e32` (VOP3C)

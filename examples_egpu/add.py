@@ -809,33 +809,42 @@ def parse_firmware_info(bios: bytes, data_table: int) -> dict:
 
 
 def parse_vram_info(bios: bytes, data_table: int) -> dict | None:
-  """atom_vram_info_header_v2_3 + first atom_vram_module_v9 (Polaris GDDR5)."""
+  """Decode the first Polaris v2.2 / module-v8 entry (Linux atombios.h).
+
+  usStructureSize covers the entire table, not just its fixed header. Unknown
+  revisions are deliberately not decoded as a different module layout.
+  """
   off = mdt_offset(bios, data_table, MDT_IDX_VRAM_INFO)
-  if not off or off + 0x18 > len(bios):
+  if not off or off + 20 > len(bios):
     return None
-  hdr_size = _u16(bios, off)
-  if hdr_size < 0x18 or off + hdr_size > len(bios):
+  table_size = _u16(bios, off)
+  if table_size < 20 or off + table_size > len(bios):
     return None
-  mod = off + hdr_size
-  if mod + 0x34 > len(bios):
+  if (_u8(bios, off + 2), _u8(bios, off + 3), _u8(bios, off + 18)) != (2, 2, 8):
     return None
-  mem_type = _u8(bios, mod + 23)
+  if _u8(bios, off + 16) == 0:
+    return None
+  mod = off + 20
+  if mod + 44 > off + table_size:
+    return None
+  module_size = _u16(bios, mod + 4)
+  if module_size < 44 or mod + module_size > off + table_size:
+    return None
+  mem_type = _u8(bios, mod + 11)
   return {
     "off": off,
     "format_rev": _u8(bios, off + 2),
     "content_rev": _u8(bios, off + 3),
     "mc_phyinit_off": _u16(bios, off + 0xA),
-    "post_ucode_init_off": _u16(bios, off + 0x10),
-    "module_num": _u8(bios, off + 0x14),
-    "memory_size_mb": _u32(bios, mod),
-    "channel_enable": _u32(bios, mod + 4),
-    "max_mem_clk_10khz": _u32(bios, mod + 8),
+    "module_num": _u8(bios, off + 16),
+    "memory_size_mb": _u16(bios, mod + 20),
+    "channel_enable": _u16(bios, mod + 8),
     "memory_type": mem_type,
     "memory_type_name": _DGPU_MEM_TYPE.get(mem_type, f"0x{mem_type:02x}"),
-    "channel_num": _u8(bios, mod + 24),
-    "channel_width": _u8(bios, mod + 25),
-    "tuning_set_id": _u8(bios, mod + 27),
-    "part_number": _cstr(bios, mod + 32, 20).decode("ascii", "replace"),
+    "channel_num": _u8(bios, mod + 12),
+    "channel_width": _u8(bios, mod + 13),
+    "tuning_set_id": _u8(bios, mod + 22),
+    "part_number": _cstr(bios, mod + 44, min(20, module_size - 44)).decode("ascii", "replace"),
   }
 
 
@@ -2153,18 +2162,37 @@ class PolarisBoot:
   def deactivate_hqd(self, me=0, pipe=0, queue=0, req: int = 1, timeout_s: float = 1.0):
     """gfx_v8_0_deactivate_hqd — drain queue before MQD reprogram."""
     self.srbm_select(me, pipe, queue, 0)
-    if self.rreg(mmCP_HQD_ACTIVE) & 1:
-      self.wreg(mmCP_HQD_DEQUEUE_REQUEST, req)
-      deadline = time.time() + timeout_s
-      while time.time() < deadline:
-        if not (self.rreg(mmCP_HQD_ACTIVE) & 1):
-          break
-        time.sleep(0.001)
-    self.wreg(mmCP_HQD_DEQUEUE_REQUEST, 0)
-    self.wreg(mmCP_HQD_PQ_RPTR, 0)
-    self.wreg(mmCP_HQD_PQ_WPTR, 0)
-    self.srbm_select(0, 0, 0, 0)
+    try:
+      if self.rreg(mmCP_HQD_ACTIVE) & 1:
+        self.wreg(mmCP_HQD_DEQUEUE_REQUEST, req)
+        deadline = time.monotonic() + timeout_s
+        while self.rreg(mmCP_HQD_ACTIVE) & 1:
+          if time.monotonic() >= deadline:
+            # Leave the request and pointers intact: the engine still owns them.
+            raise RuntimeError(f"HQD dequeue timed out: me={me} pipe={pipe} queue={queue}; "
+                               "queue is still active, DMA memory must remain mapped")
+          time.sleep(0.001)
+      self.wreg(mmCP_HQD_DEQUEUE_REQUEST, 0)
+      self.wreg(mmCP_HQD_PQ_RPTR, 0)
+      self.wreg(mmCP_HQD_PQ_WPTR, 0)
+    finally:
+      self.srbm_select(0, 0, 0, 0)
+      self.mmio_sync_safe()
+
+  def quiesce_compute(self, timeout_s: float = 1.0):
+    """Stop the example's KCQ/KIQ before releasing their host buffers.
+
+    This checks compute queues only, not SMC/SDMA or outstanding PCIe traffic.
+    Failure is not permission to close the transport or free DMA mappings.
+    """
+    for me, pipe, queue in ((1, 0, 0), (KIQ_ME, KIQ_PIPE, KIQ_QUEUE)):
+      self.deactivate_hqd(me, pipe, queue, timeout_s=timeout_s)
+    self.wreg(mmCP_PQ_WPTR_POLL_CNTL,
+              self.rreg(mmCP_PQ_WPTR_POLL_CNTL) & ~mmCP_PQ_WPTR_POLL_CNTL__EN_MASK)
+    self.cp_compute_enable(False)
     self.mmio_sync_safe()
+    if self.rreg(mmCP_MEC_CNTL) & CP_MEC_CNTL_HALT != CP_MEC_CNTL_HALT:
+      raise RuntimeError("MEC halt readback failed; DMA memory must remain mapped")
 
   def boot_through_fw_direct(self, fw_mask: int | None = None, unhalt: bool | None = None):
     """ATOM → SMC → MC → GART → direct MMIO firmware (no compute/KIQ)."""
@@ -2804,7 +2832,7 @@ class PolarisBoot:
       self.vram_start = 0
       fb_span = 0
     if mem_mb in (0, 0xffff) or mem_mb < 128:
-      mem_mb = int(os.environ.get("AMD_VRAM_MB", "4096"))
+      mem_mb = self.fallback_vram_mb()
     self.vram_size = mem_mb * 1024 * 1024
     # Prefer the hardware FB window for aperture placement (AGP sits above it).
     # Full GDDR5 size stays in vram_size for MEMSIZE reporting.
@@ -2876,22 +2904,34 @@ class PolarisBoot:
     self.wreg(mmMC_VM_AGP_TOP, self.agp_end >> 22)
     self.wreg(mmMC_VM_AGP_BOT, self.agp_start >> 22)
 
+  @staticmethod
+  def fallback_vram_mb() -> int:
+    """Fallback must fit CONFIG_MEMSIZE and the 16 MiB framebuffer granularity."""
+    mem_mb = int(os.environ.get("AMD_VRAM_MB", "4096"))
+    if not 128 <= mem_mb < 0xffff or mem_mb % 16:
+      raise ValueError("AMD_VRAM_MB must be a multiple of 16 in [128, 65520]")
+    return mem_mb
+
   def mc_program_light(self):
     """Minimal MC when VRAM not fully trained — avoid clobbering VBIOS apertures."""
     self.mc_init_locations()
     self.dev._vram_start = self.vram_visible_mc
     mem_mb = self.rreg(mmCONFIG_MEMSIZE) & 0xffff
-    want_mb = int(os.environ.get("AMD_VRAM_MB", "4096"))
-    if mem_mb < 128 and want_mb >= 128:
+    want_mb = self.fallback_vram_mb()
+    if mem_mb < 128 or mem_mb == 0xffff:
       self.vram_start = 0
       self.vram_size = want_mb * 1024 * 1024
-      self.vram_end = (self.vram_size - 1) & 0xffffffff
+      self.vram_end = self.vram_size - 1
       bar_bytes = self.dev.bar0_size
-      self.vram_visible_mc = (self.vram_end - bar_bytes + 1) & 0xffffffff if self.vram_size > bar_bytes else self.vram_start
+      self.vram_visible_mc = self.vram_end - min(bar_bytes, self.vram_size) + 1
       self.dev._vram_start = self.vram_visible_mc
       self.wreg(mmCONFIG_MEMSIZE, want_mb)
       tmp = ((self.vram_end >> 24) & 0xffff) << 16 | ((self.vram_start >> 24) & 0xffff)
       self.wreg(mmMC_VM_FB_LOCATION, tmp)
+      # Recompute AGP/GART against the actual fallback FB range, not stale ROM
+      # aperture values. Keep the full 40-bit MC address domain above 4 GiB.
+      self.mc_init_locations()
+      self.dev._vram_start = self.vram_visible_mc
     self.mc_program_apertures()
     self.wreg(mmBIF_FB_EN, 0x3)
     self.mmio_sync_safe()
@@ -5124,7 +5164,8 @@ class PolarisDevice:
     self.pci = APLRemotePCIDevice("AMD", "usb4")
     vid, did = self._open_config(self.pci, reset=reset)
     if did != self.PCI_DID_RX570 and getenv("AMD_EGPU_ALLOW_ANY", 0) == 0:
-      print(f"warning: device {did:#06x} is not RX570 ({self.PCI_DID_RX570:#06x}); set AMD_EGPU_ALLOW_ANY=1 to continue")
+      raise RuntimeError(f"device {did:#06x} is not the tested RX570 ({self.PCI_DID_RX570:#06x}); "
+                         "review compatibility before opting in with AMD_EGPU_ALLOW_ANY=1")
     self.vram = self.pci.map_bar(0)          # VRAM window (256MB BAR typical)
     self.doorbell = self.pci.map_bar(2, fmt='I')  # VI doorbells are 32-bit byte-indexed
     self.mmio = self.pci.map_bar(5, fmt='I') # register aperture
